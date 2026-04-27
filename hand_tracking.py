@@ -7,6 +7,7 @@ import threading
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
+from logger_utils import log_event
 
 def is_handshake_pose(lm):
     return abs(lm[0].x - lm[5].x) < 0.1
@@ -31,39 +32,44 @@ def run_hand_tracking():
     prev_x, prev_y = 0, 0
     scroll_mode = None
     scroll_thread = None
-    stop_scroll = False
+    stop_scroll = threading.Event()
     zoom_state = "idle"
     zoom_triggered = False
     zoom_start_distance = None
+
     volume_mode = None
     volume_start_distance = None
+    last_volume_time = 0
+    volume_cooldown = 0.3
 
-    if 'flick_ready' not in globals():
-        global flick_ready
-        flick_ready = False
-    if 'prev_finger_positions' not in globals():
-        global prev_finger_positions
-        prev_finger_positions = []
+    flick_ready = False
+    prev_finger_positions = []
+    flick_last_time = 0
+    flick_cooldown = 0.6
 
+    click_ready = True
+    
     def scroll_loop(direction):
         nonlocal stop_scroll
-        while not stop_scroll:
+        while not stop_scroll.is_set():
             pyautogui.scroll(direction)
             time.sleep(0.002)
-
+            
     def start_scrolling(direction):
         nonlocal scroll_thread, stop_scroll
-        stop_scroll = False
-        scroll_thread = threading.Thread(target=scroll_loop, args=(direction,))
+        if scroll_thread is not None and scroll_thread.is_alive():
+            return
+        stop_scroll.clear()
+        scroll_thread = threading.Thread(target=scroll_loop, args=(direction,), daemon=True)
         scroll_thread.start()
-
+        
     def stop_scrolling():
         nonlocal stop_scroll, scroll_thread
-        stop_scroll = True
-        if scroll_thread:
-            scroll_thread.join()
-            scroll_thread = None
-
+        stop_scroll.set()
+        if scroll_thread is not None and scroll_thread.is_alive():
+            scroll_thread.join(timeout=0.1)
+        scroll_thread = None
+        
     def is_index_only_up(landmarks):
         lm = landmarks.landmark
         return (
@@ -108,60 +114,84 @@ def run_hand_tracking():
         gesture_detected = False
         hand_data = result.multi_hand_landmarks
 
-        last_volume_time = 0
-        cooldown = 0.3
-        volume_gesture_active = False
-
         if hand_data:
             hand_count = len(hand_data)
 
             # === Flick Left Detection (only after handshake pose) ===
             if hand_count == 1:
                 lm = hand_data[0].landmark
-                if is_handshake_pose(lm):
+                if is_handshake_pose(lm) and not flick_ready:
                     flick_ready = True
-
+                    prev_finger_positions = []
+                    
                 if flick_ready:
                     fingertip_ids = [8, 12, 16, 20]
                     curr_finger_positions = [(lm[i].x, lm[i].y) for i in fingertip_ids]
 
                     if prev_finger_positions:
-                        flick_last_time = 0
-                        flick_cooldown = 0.6  # seconds
                         current_time = time.time()
                         if current_time - flick_last_time > flick_cooldown:
                             if fingers_flicked_left(prev_finger_positions, curr_finger_positions):
+                                log_event("hand", "gesture_recognized", "flick_left_tab_switch")
                                 pyautogui.hotkey('ctrl', 'shift', 'tab')
+                                log_event("hand", "action", "flick_left_tab_switch")
                                 flick_ready = False
+                                prev_finger_positions = []
                                 flick_last_time = current_time
-
-
+                                                                                                
                     prev_finger_positions = curr_finger_positions
 
-            for hand_landmarks in hand_data:
-                x_index = hand_landmarks.landmark[8].x
-                if x_index > 0.5:
-                    dist = get_thumb_index_distance(hand_landmarks, w, h)
-                    if is_hand_open(hand_landmarks):
-                        volume_mode = None
-                        volume_start_distance = None
-                    else:
-                        if volume_start_distance is None:
-                            volume_start_distance = dist
-                            volume_mode = "idle"
-                        else:
-                            delta = dist - volume_start_distance
-                            current_time = time.time()
-                            if delta > 30 and current_time - last_volume_time > cooldown:
-                                pyautogui.press('volumeup')
-                                volume_mode = "up"
-                                last_volume_time = current_time
-                            elif delta < -30 and current_time - last_volume_time > cooldown:
-                                pyautogui.press('volumedown')
-                                volume_mode = "down"
-                                last_volume_time = current_time
-                    break
+            if hand_count == 1:
+                hand_landmarks = hand_data[0]
+                lm = hand_landmarks.landmark
 
+                fingers_up = {
+                    "thumb": lm[4].x < lm[3].x,
+                    "index": lm[8].y < lm[6].y,
+                    "middle": lm[12].y < lm[10].y,
+                    "ring": lm[16].y < lm[14].y,
+                    "pinky": lm[20].y < lm[18].y
+                }
+
+                volume_pose = (
+                    fingers_up["index"] and
+                    not fingers_up["middle"] and
+                    not fingers_up["ring"] and
+                    not fingers_up["pinky"]
+                )
+
+                if volume_pose:
+                    dist = get_thumb_index_distance(hand_landmarks, w, h)
+
+                    if volume_start_distance is None:
+                        volume_start_distance = dist
+                        volume_mode = "idle"
+                    else:
+                        delta = dist - volume_start_distance
+                        current_time = time.time()
+                        if delta > 30 and current_time - last_volume_time > volume_cooldown:
+                            log_event("hand", "gesture_recognized", "volume_up", round(delta, 2))
+                            pyautogui.press('volumeup')
+                            log_event("hand", "action", "volume_up", round(delta, 2))
+                            volume_mode = "up"
+                            last_volume_time = current_time
+                        elif delta < -30 and current_time - last_volume_time > volume_cooldown:
+                            log_event("hand", "gesture_recognized", "volume_down", round(delta, 2))
+                            pyautogui.press('volumedown')
+                            log_event("hand", "action", "volume_down", round(delta, 2))
+                            volume_mode = "down"
+                            last_volume_time = current_time
+                else:
+                    volume_mode = None
+                    volume_start_distance = None
+            else:
+                volume_mode = None
+                volume_start_distance = None
+                                
+            if hand_count != 1:
+                flick_ready = False
+                prev_finger_positions = []
+           
             if hand_count == 2:
                 lm1 = hand_data[0]
                 lm2 = hand_data[1]
@@ -182,11 +212,15 @@ def run_hand_tracking():
                     else:
                         delta = distance - zoom_start_distance
                         if delta > 40 and not zoom_triggered:
+                            log_event("hand", "gesture_recognized", "zoom_in", round(delta, 2))
                             pyautogui.hotkey('ctrl', '+')
+                            log_event("hand", "action", "zoom_in", round(delta, 2))
                             zoom_triggered = True
                             zoom_state = "in"
                         elif delta < -40 and not zoom_triggered:
+                            log_event("hand", "gesture_recognized", "zoom_out", round(delta, 2))
                             pyautogui.hotkey('ctrl', '-')
+                            log_event("hand", "action", "zoom_out", round(delta, 2))
                             zoom_triggered = True
                             zoom_state = "out"
                 else:
@@ -226,42 +260,76 @@ def run_hand_tracking():
 
                 thumb_tip = lm[4]
                 index_base = lm[5]
-                if (fingers_up["index"] and fingers_up["middle"] and fingers_up["ring"] and fingers_up["pinky"]
-                        and thumb_tip.y > index_base.y
-                        and abs(thumb_tip.x - index_base.x) < 0.03):
-                    pyautogui.click()
-                    time.sleep(0.3)
 
+                thumb_to_index_base = math.hypot(
+                    (thumb_tip.x - index_base.x) * w,
+                    (thumb_tip.y - index_base.y) * h
+                )
+
+                click_pose = (
+                    fingers_up["index"] and fingers_up["middle"] and fingers_up["ring"] and fingers_up["pinky"]
+                    and thumb_tip.y > index_base.y
+                    and thumb_to_index_base < 45
+                )
+
+                if click_pose and click_ready:
+                    log_event("hand", "gesture_recognized", "click")
+                    pyautogui.click()
+                    log_event("hand", "action", "click")
+                    click_ready = False
+                elif not click_pose:
+                    click_ready = True
                 if (finger_dist < 25 and
                     fingers_up["index"] and fingers_up["middle"] and
-                    not fingers_up["thumb"] and not fingers_up["ring"] and not fingers_up["pinky"] and
+                    not fingers_up["ring"] and not fingers_up["pinky"] and
                     lm[8].y < lm[6].y and lm[12].y < lm[10].y):
                     gesture_detected = True
                     if scroll_mode != "up":
+                        log_event("hand", "gesture_recognized", "scroll_up_start")
                         stop_scrolling()
                         start_scrolling(40)
+                        log_event("hand", "action", "scroll_up_start")
                         scroll_mode = "up"
-
+                                                                        
                 elif (finger_dist < 25 and
-                      not fingers_up["thumb"] and not fingers_up["ring"] and not fingers_up["pinky"] and
+                      not fingers_up["ring"] and not fingers_up["pinky"] and
                       lm[8].z < lm[6].z and lm[12].z < lm[10].z):
                     gesture_detected = True
                     if scroll_mode != "down":
+                        log_event("hand", "gesture_recognized", "scroll_down_start")
                         stop_scrolling()
                         start_scrolling(-40)
+                        log_event("hand", "action", "scroll_down_start")
                         scroll_mode = "down"
-
+                                                                        
                 cv2.circle(img, (ix, iy), 10, (0, 255, 0), -1)
                 cv2.circle(img, (mx, my), 10, (255, 255, 0), -1)
 
-        if not gesture_detected and scroll_mode is not None:
-            stop_scrolling()
-            scroll_mode = None
+        if not hand_data:
+            if scroll_mode is not None:
+                stop_scrolling()
+                log_event("hand", "action", "scroll_stop")
+                scroll_mode = None
+                
+            volume_mode = None
+            volume_start_distance = None
+            zoom_state = "idle"
+            zoom_triggered = False
+            zoom_start_distance = None
+            flick_ready = False
+            prev_finger_positions = []
+            click_ready = True
 
+        elif not gesture_detected and scroll_mode is not None:
+            stop_scrolling()
+            log_event("hand", "action", "scroll_stop")
+            scroll_mode = None
+            
         cv2.imshow("Hand Control System", img)
         if cv2.waitKey(1) & 0xFF == ord('q'):
+            log_event("system", "shutdown", "q_pressed_in_hand_window")
             break
-
+        
     stop_scrolling()
     cap.release()
     cv2.destroyAllWindows()
